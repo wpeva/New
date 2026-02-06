@@ -6,7 +6,8 @@
 #    1. Читает список серверов из servers.txt
 #    2. Заходит на каждый по SSH
 #    3. Ставит и запускает 3proxy
-#    4. Выводит готовый список прокси с разными IP (подсетями)
+#    4. Проверяет, что подсети реально разные
+#    5. Выводит готовый список прокси + сохраняет в файл
 #
 #  Запуск:
 #    bash deploy-multi-proxy.sh
@@ -21,6 +22,7 @@
 set -euo pipefail
 
 # --------------------- НАСТРОЙКИ ----------------------------
+# >>>  ПОМЕНЯЙ ЭТИ ЗНАЧЕНИЯ ПЕРЕД ЗАПУСКОМ  <<<
 
 PROXY_USER="proxyuser"         # единый логин для всех прокси
 PROXY_PASS="SuperSecret123"    # единый пароль (ПОМЕНЯЙ!)
@@ -36,10 +38,10 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-ok()   { echo -e "${GREEN}[OK]${NC} $1"; }
-info() { echo -e "${YELLOW}[..]${NC} $1"; }
-fail() { echo -e "${RED}[!!]${NC} $1"; }
-head() { echo -e "\n${CYAN}${BOLD}$1${NC}\n"; }
+ok()    { echo -e "${GREEN}[OK]${NC} $1"; }
+info()  { echo -e "${YELLOW}[..]${NC} $1"; }
+fail()  { echo -e "${RED}[!!]${NC} $1"; }
+header(){ echo -e "\n${CYAN}${BOLD}$1${NC}\n"; }
 
 # --------------------- ПРОВЕРКИ -----------------------------
 
@@ -83,15 +85,16 @@ if [ "$TOTAL" -eq 0 ]; then
   exit 1
 fi
 
-head "Найдено серверов: ${TOTAL}"
-echo "  Логин прокси: ${PROXY_USER}"
+header "Найдено серверов: ${TOTAL}"
+echo "  Логин прокси:  ${PROXY_USER}"
 echo "  Пароль прокси: ${PROXY_PASS}"
-echo "  Порт прокси:  ${PROXY_PORT}"
+echo "  Порт прокси:   ${PROXY_PORT}"
 echo ""
 
 # --------------------- ДЕПЛОЙ -------------------------------
 
 SUCCESS_LIST=()
+SUCCESS_IPS=()
 FAIL_LIST=()
 
 for i in "${!SERVERS[@]}"; do
@@ -117,16 +120,17 @@ for i in "${!SERVERS[@]}"; do
            -P "${SSH_PORT}" \
            "${INSTALLER_PATH}" \
            "root@${SERVER_IP}:/tmp/install-on-node.sh" 2>/dev/null; then
-    fail "  Не удалось скопировать файл на ${SERVER_IP}. Пропускаю."
-    FAIL_LIST+=("${SERVER_IP}  —  ошибка SCP")
+    fail "  Не удалось подключиться к ${SERVER_IP}. Пропускаю."
+    FAIL_LIST+=("${SERVER_IP}  —  ошибка подключения (SCP)")
     continue
   fi
 
   # 2. Запускаем установщик на сервере
-  info "  Установка 3proxy (это может занять 1–3 минуты)..."
+  info "  Установка 3proxy (1–3 минуты)..."
   REMOTE_OUTPUT=$(sshpass -p "${SERVER_PASS}" \
        ssh -o StrictHostKeyChecking=no \
            -o ConnectTimeout=15 \
+           -o ServerAliveInterval=30 \
            -o UserKnownHostsFile=/dev/null \
            -o LogLevel=ERROR \
            -p "${SSH_PORT}" \
@@ -138,62 +142,123 @@ for i in "${!SERVERS[@]}"; do
     REAL_IP=$(echo "$REMOTE_OUTPUT" | grep "\[OK\] ГОТОВО" | sed 's/.*ГОТОВО: //' | cut -d: -f1)
     ok "  Прокси работает: ${REAL_IP}:${PROXY_PORT}"
     SUCCESS_LIST+=("${REAL_IP}:${PROXY_PORT}")
+    SUCCESS_IPS+=("${REAL_IP}")
   else
     fail "  Установка не удалась на ${SERVER_IP}"
-    echo "  Лог: $(echo "$REMOTE_OUTPUT" | tail -3)"
+    # Показываем последние строки для диагностики
+    LAST_LINES=$(echo "$REMOTE_OUTPUT" | tail -3)
+    [ -n "$LAST_LINES" ] && echo "  Лог: ${LAST_LINES}"
     FAIL_LIST+=("${SERVER_IP}  —  ошибка установки")
   fi
 done
 
+# --------------------- ПРОВЕРКА ПОДСЕТЕЙ --------------------
+
+check_subnets() {
+  local ips=("$@")
+  local subnets=()
+  local duplicates=()
+
+  for ip in "${ips[@]}"; do
+    # Берём первые 3 октета = подсеть /24
+    subnet=$(echo "$ip" | cut -d. -f1-3)
+    if [[ " ${subnets[*]:-} " == *" ${subnet} "* ]]; then
+      duplicates+=("${ip} (подсеть ${subnet}.x)")
+    fi
+    subnets+=("$subnet")
+  done
+
+  # Уникальные подсети
+  local unique
+  unique=$(printf '%s\n' "${subnets[@]}" | sort -u | wc -l)
+
+  echo ""
+  header "ПРОВЕРКА ПОДСЕТЕЙ (/24)"
+  echo ""
+  printf "  %-20s  %-18s\n" "IP-адрес" "Подсеть"
+  echo "  ──────────────────  ──────────────────"
+  for ip in "${ips[@]}"; do
+    subnet=$(echo "$ip" | cut -d. -f1-3)
+    printf "  %-20s  %s.x\n" "$ip" "$subnet"
+  done
+  echo ""
+
+  if [ ${#duplicates[@]} -gt 0 ]; then
+    fail "ВНИМАНИЕ: найдены IP из одинаковых подсетей!"
+    for d in "${duplicates[@]}"; do
+      echo -e "    ${RED}⚠${NC}  ${d}"
+    done
+    echo ""
+    fail "Совет: замени дублирующиеся VPS на серверы из другого хостинга/ДЦ."
+  else
+    ok "Все ${unique} IP из разных подсетей — отлично!"
+  fi
+}
+
 # --------------------- ИТОГОВЫЙ ОТЧЁТ ----------------------
 
 echo ""
-echo "══════════════════════════════════════════════════════"
-echo ""
+echo "══════════════════════════════════════════════════════════"
 
 if [ ${#SUCCESS_LIST[@]} -gt 0 ]; then
-  head "ГОТОВЫЕ ПРОКСИ (${#SUCCESS_LIST[@]} шт, все — разные подсети):"
+
+  # Проверяем подсети
+  check_subnets "${SUCCESS_IPS[@]}"
+
+  header "ГОТОВЫЕ ПРОКСИ (${#SUCCESS_LIST[@]} шт):"
   echo ""
 
-  # Формат: IP:PORT:USER:PASS (удобно для импорта в софт)
+  # Формат 1: IP:PORT:USER:PASS (для импорта в софт)
   echo "  Формат  IP:PORT:USER:PASS"
-  echo "  ────────────────────────────────────────"
+  echo "  ─────────────────────────────────────────────"
   for proxy_addr in "${SUCCESS_LIST[@]}"; do
     echo "  ${proxy_addr}:${PROXY_USER}:${PROXY_PASS}"
   done
 
   echo ""
+
+  # Формат 2: URL (для curl / requests / браузера)
   echo "  Формат  http://USER:PASS@IP:PORT"
-  echo "  ────────────────────────────────────────"
+  echo "  ─────────────────────────────────────────────"
   for proxy_addr in "${SUCCESS_LIST[@]}"; do
     echo "  http://${PROXY_USER}:${PROXY_PASS}@${proxy_addr}"
   done
 
-  # Сохраняем в файл
+  # Сохраняем оба формата в файлы
   PROXY_FILE="${SCRIPT_DIR}/proxy-list.txt"
+  PROXY_URL_FILE="${SCRIPT_DIR}/proxy-list-urls.txt"
+
   > "$PROXY_FILE"
+  > "$PROXY_URL_FILE"
   for proxy_addr in "${SUCCESS_LIST[@]}"; do
     echo "${proxy_addr}:${PROXY_USER}:${PROXY_PASS}" >> "$PROXY_FILE"
+    echo "http://${PROXY_USER}:${PROXY_PASS}@${proxy_addr}" >> "$PROXY_URL_FILE"
   done
   echo ""
-  ok "Список сохранён в файл: proxy-list.txt"
+  ok "Сохранено: proxy-list.txt       (формат IP:PORT:USER:PASS)"
+  ok "Сохранено: proxy-list-urls.txt  (формат http://...)"
 fi
 
 if [ ${#FAIL_LIST[@]} -gt 0 ]; then
   echo ""
-  fail "НЕ УДАЛОСЬ установить на ${#FAIL_LIST[@]} сервер(ов):"
+  fail "Не удалось установить на ${#FAIL_LIST[@]} сервер(ов):"
   for f in "${FAIL_LIST[@]}"; do
     echo "    ✗  ${f}"
   done
 fi
 
 echo ""
-echo "  Проверка любого прокси:"
-echo ""
+echo "  ─────────────────────────────────────────────"
 if [ ${#SUCCESS_LIST[@]} -gt 0 ]; then
   FIRST="${SUCCESS_LIST[0]}"
+  echo "  Быстрая проверка (запусти с домашнего ПК):"
+  echo ""
   echo "    curl -x http://${PROXY_USER}:${PROXY_PASS}@${FIRST} http://ifconfig.me"
+  echo ""
+  echo "  Проверить ВСЕ прокси разом:"
+  echo ""
+  echo "    bash check-proxies.sh"
 fi
 echo ""
-echo "══════════════════════════════════════════════════════"
+echo "══════════════════════════════════════════════════════════"
 echo ""
